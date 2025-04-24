@@ -1,6 +1,8 @@
 module github.com/mburtless/geoip-processor
 
-go 1.18
+go 1.24
+
+toolchain go1.24.2
 
 require (
 	github.com/envoyproxy/go-control-plane v0.10.2-0.20220325020618-49ff273808a1
