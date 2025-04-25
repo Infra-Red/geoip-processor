@@ -2,57 +2,79 @@ package main
 
 import (
 	"context"
+	_ "embed" // blank import for embed support.
 	"errors"
-	"log"
+	"fmt"
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
 
-	"github.com/mburtless/geoip-processor/internal/server"
+	"code.cloudfoundry.org/go-envstruct"
+	"code.cloudfoundry.org/lager/v3"
+	"github.com/Infra-Red/geoip-processor/internal/server"
 	"github.com/oschwald/geoip2-golang"
-	"go.uber.org/zap"
 	"google.golang.org/grpc"
 )
 
+var (
+	//go:embed GeoIP2-Country.mmdb
+	geoIpCountryDatabase []byte
+	//go:embed GeoIP2-City.mmdb
+	geoIpCityDatabase []byte
+)
+
 type config struct {
-	addr          string
-	maxConStreams int
-	logger        *zap.Logger
-	dbPath        string
+	Addr                string   `env:"ADDR,                   report"`
+	BlockedCountryCodes []string `env:"BLOCKED_COUNTRY_CODES,  report"` // TODO: also support subdivisions
+	MaxConStreams       int      `env:"MAX_CONCURRENT_STREAMS, report"`
+	// non-env
+	blockedCountryCodesLookupMap map[string]struct{}
+	logger                       lager.Logger
 }
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	cfg := getConfig()
+	logger := lager.NewLogger("geoip-processor")
+	logLevelFromEnvString, ok := os.LookupEnv("LOG_LEVEL")
+	if !ok {
+		logger.RegisterSink(lager.NewPrettySink(os.Stdout, lager.INFO)) // default to INFO level
+	} else {
+		logLevel, err := lager.LogLevelFromString(logLevelFromEnvString)
+		if err != nil {
+			panic(err)
+		}
+		logger.RegisterSink(lager.NewPrettySink(os.Stdout, logLevel))
+	}
 
-	// init logger
-	cfg.logger, _ = zap.NewDevelopment()
+	cfg, err := getConfig()
+	if err != nil {
+		logger.Fatal("load-config", err)
+	}
+	cfg.logger = logger
 
-	err := run(ctx, cfg)
-	if err != nil && !errors.Is(err, context.Canceled) {
-		cfg.logger.Fatal("error running server", zap.Error(err))
+	if err := run(ctx, cfg); err != nil && !errors.Is(err, context.Canceled) {
+		cfg.logger.Fatal("error-running-server", err)
 	}
 }
 
 func run(ctx context.Context, cfg *config) error {
-	db, err := geoip2.Open(cfg.dbPath)
+	db, err := geoip2.FromBytes(geoIpCountryDatabase)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	lis, err := net.Listen("tcp", cfg.addr)
+	lis, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		return err
 	}
 
-	opts := []grpc.ServerOption{grpc.MaxConcurrentStreams(uint32(cfg.maxConStreams))}
+	opts := []grpc.ServerOption{grpc.MaxConcurrentStreams(uint32(cfg.MaxConStreams))}
 	s := grpc.NewServer(opts...)
 
-	srv := server.NewServer(cfg.logger, db)
+	srv := server.NewServer(cfg.logger, db, cfg.blockedCountryCodesLookupMap)
 	srv.RegisterServer(s)
 
 	errChan := make(chan error, 1)
@@ -60,38 +82,38 @@ func run(ctx context.Context, cfg *config) error {
 		errChan <- s.Serve(lis)
 	}()
 
-	cfg.logger.Info("starting server", zap.String("address", cfg.addr))
+	cfg.logger.Info("starting-server", lager.Data{"address": cfg.Addr})
 	select {
 	case err := <-errChan:
 		return err
 	case <-ctx.Done():
-		cfg.logger.Info("stopping server")
+		cfg.logger.Info("stopping-server")
 		s.GracefulStop()
 		return ctx.Err()
 	}
 }
 
-func getConfig() *config {
-	var (
-		ok  bool
-		cfg config
-		err error
-	)
-	// parse addr, max concurrent streams
-	cfg.addr, ok = os.LookupEnv("ADDR")
-	if !ok {
-		cfg.addr = "localhost:8000"
+func getConfig() (*config, error) {
+	cfg := config{
+		Addr:          "localhost:8000",
+		MaxConStreams: 1000,
 	}
-	cfg.maxConStreams, err = strconv.Atoi(os.Getenv("MAX_CONCURRENT_STREAMS"))
-	if err != nil {
-		cfg.maxConStreams = 1000
+
+	if err := envstruct.Load(&cfg); err != nil {
+		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
-	cfg.dbPath, ok = os.LookupEnv("GEOIP_DB")
-	if !ok || cfg.dbPath == "" {
-		log.Fatal("GEOIP_DB required")
+
+	// Populate the map from the slice for better lookup performance
+	cfg.blockedCountryCodesLookupMap = make(map[string]struct{}, len(cfg.BlockedCountryCodes))
+	for _, item := range cfg.BlockedCountryCodes {
+		cfg.blockedCountryCodesLookupMap[item] = struct{}{}
+	}
+
+	if err := envstruct.WriteReport(&cfg); err != nil {
+		return nil, fmt.Errorf("failed to write config report: %w", err)
 	}
 
 	// TODO: allow config of which http header to extract req IP from (XFF, x-real-ip, etc)
 	// TODO: allow config of which http header to inject country code in
-	return &cfg
+	return &cfg, nil
 }

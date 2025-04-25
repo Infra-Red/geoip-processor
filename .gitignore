@@ -22,3 +22,6 @@
 
 # dumb mac stuff
 .DS_Store
+
+# env
+.envrc
