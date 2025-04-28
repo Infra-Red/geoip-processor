@@ -4,9 +4,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 
 	"code.cloudfoundry.org/lager/v3"
-	v31 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	pb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"github.com/oschwald/geoip2-golang"
@@ -14,11 +14,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 var (
-	defaultAuthorityReqHeader = ":authority"
-	defaultIPReqHeader        = "x-forwarded-for"
+	sourceAddressFeild = "source.address"
+	requestHostFeild   = "request.host"
 )
 
 const StatusCode_NoResponse = typev3.StatusCode(444)
@@ -31,8 +32,6 @@ type Server struct {
 	blockedCountryCodesLookupMap map[string]struct{}
 	ccRespHeader                 string
 	geoIPDB                      geoIP2DB
-	authorityReqHeader           string
-	ipReqHeader                  string
 	logger                       lager.Logger
 }
 
@@ -40,8 +39,6 @@ func NewServer(l lager.Logger, db geoIP2DB, blockedCountryCodes map[string]struc
 	svr := &Server{
 		blockedCountryCodesLookupMap: blockedCountryCodes,
 		geoIPDB:                      db,
-		authorityReqHeader:           defaultAuthorityReqHeader,
-		ipReqHeader:                  defaultIPReqHeader,
 		logger:                       l,
 	}
 	for _, opt := range opts {
@@ -77,10 +74,7 @@ func (s *Server) Process(srv pb.ExternalProcessor_ProcessServer) error {
 		resp := &pb.ProcessingResponse{}
 		switch v := req.Request.(type) {
 		case *pb.ProcessingRequest_RequestHeaders:
-			s.logger.Debug("pb.ProcessingRequest_RequestHeaders")
-			r := req.Request
-			h := r.(*pb.ProcessingRequest_RequestHeaders)
-			resp = s.handleReqHeaders(h)
+			resp = s.handleReqAttributes(req.Attributes)
 			break
 		default:
 			s.logger.Error("unknown request type", errors.New("unknown request type"), lager.Data{"req": v})
@@ -91,8 +85,22 @@ func (s *Server) Process(srv pb.ExternalProcessor_ProcessServer) error {
 	}
 }
 
-func (s *Server) handleReqHeaders(h *pb.ProcessingRequest_RequestHeaders) *pb.ProcessingResponse {
-	ip, host := s.extractIPFromReqHeaders(h.RequestHeaders.GetHeaders().GetHeaders())
+func (s *Server) handleReqAttributes(a map[string]*structpb.Struct) *pb.ProcessingResponse {
+	var ip, host string
+
+	if a != nil {
+		if epa, ok := a["envoy.filters.http.ext_proc"]; ok {
+			if rqa, ok := epa.Fields[sourceAddressFeild]; ok {
+				ip = strings.Split(rqa.GetStringValue(), ":")[0]
+			}
+		}
+		if epa, ok := a["envoy.filters.http.ext_proc"]; ok {
+			if rqa, ok := epa.Fields[requestHostFeild]; ok {
+				host = rqa.GetStringValue()
+			}
+		}
+	}
+
 	if ip != "" {
 		ipAddr := net.ParseIP(ip)
 		countryRecord, err := s.geoIPDB.Country(ipAddr)
@@ -104,19 +112,6 @@ func (s *Server) handleReqHeaders(h *pb.ProcessingRequest_RequestHeaders) *pb.Pr
 	}
 
 	return &pb.ProcessingResponse{}
-}
-
-func (s *Server) extractIPFromReqHeaders(h []*v31.HeaderValue) (string, string) {
-	var ip, host string
-	for _, v := range h {
-		if v.GetKey() == s.ipReqHeader {
-			ip = string(v.GetRawValue())
-			s.logger.Debug("ip-header-found", lager.Data{s.ipReqHeader: ip})
-		} else if v.GetKey() == s.authorityReqHeader {
-			host = string(v.GetRawValue())
-		}
-	}
-	return ip, host
 }
 
 func (s *Server) resp(countryRecord *geoip2.Country, ip, host string) *pb.ProcessingResponse {
